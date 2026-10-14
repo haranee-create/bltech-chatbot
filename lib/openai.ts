@@ -1,4 +1,4 @@
-import OpenAI, { toFile } from "openai";
+import OpenAI, { APIError, toFile } from "openai";
 import type { Character } from "./types";
 import { ERA_LABEL, ERA_YEAR, FATE_TONES, FUTURE_JOBS, WORLD_SCENES, WORLD_SUMMARY, pick } from "./world";
 
@@ -50,11 +50,12 @@ const CHARACTER_SCHEMA = {
     lifespan: { type: "string", description: "생몰년. 예: '2091 ~ 2147'. 반드시 2126년을 포함." },
     outfit_prompt: {
       type: "string",
-      description: "English. Concrete outfit, gear and props for this future job, to be drawn on the subject.",
+      description:
+        "English. Concrete outfit, gear and props for this future job, to be drawn on the subject. Family-friendly: no weapons, blood, injuries or revealing clothes (swap them for harmless props).",
     },
     background_prompt: {
       type: "string",
-      description: "English. A very simple background hint from the linked world scene (1 short sentence).",
+      description: "English. One or two tiny props from the linked world scene to doodle in the background (a few words).",
     },
     ending: { type: "string", description: "한국어. 최후를 한 줄로 (40자 이내)." },
     life_story: {
@@ -109,21 +110,44 @@ ${WORLD_SUMMARY}
   return JSON.parse(res.output_text) as CharacterDraft;
 }
 
+// 주의: "pixel"이라는 단어를 넣으면 픽셀아트 일러스트처럼 너무 잘 그려진다.
+const PAINT_STYLE = `Turn this photo into a deliberately BAD, crude doodle that someone made in 3 minutes in old Microsoft Paint using only a computer mouse.
+
+How it must look:
+- Thick, shaky, wobbly black outlines drawn with the mouse brush tool; lines overshoot, don't close properly, corners are lumpy.
+- Flat paint-bucket fills from the basic Paint palette (pure red, yellow, blue, green, brown, peach skin, grey, purple). Fills leak past the lines or leave white gaps.
+- Childish, simplified anatomy: big lopsided head, dot eyes, one-line mouth, sausage arms, mitten hands — like a non-artist drew it.
+- Mostly empty pure white canvas.
+- Absolutely NOT pixel art, NOT anime, NOT a polished illustration. NO shading, NO gradients, NO texture, NO fine detail, NO text or letters.`;
+
 export async function drawPaintPortrait(image: Buffer, mimeType: string, draft: CharacterDraft): Promise<string> {
-  const prompt = `Redraw the ${draft.subject_type === "animal" ? "animal" : "person"} from the input photo as a crude digital doodle made in Microsoft Paint, drawn with a computer mouse using the pencil and brush tools.
+  const subject = draft.subject_type === "animal" ? "animal" : "person";
+  const prompt = `${PAINT_STYLE}
 
-Style (very important):
-- Shaky, wobbly, uneven mouse-drawn outlines with jagged pixel edges, no anti-aliasing.
-- Flat paint-bucket fills from the classic default Paint palette, with small white gaps where the fill missed.
-- Clumsy amateur proportions, slightly lopsided face, simple dot or scribble details — funny but still charming.
-- Plain white canvas. No shading, no gradients, no realistic texture, no text, no letters, no watermark.
+Keep it recognizable only through a few key traits: ${draft.subject_visual}.
+Draw the ${subject} as a worker of the year ${ERA_YEAR} (floating sky cities above a flooded Earth): ${draft.outfit_prompt} — reduced to a few crude shapes.
+Tiny background doodle (optional): ${draft.background_prompt}.
+Keep it wholesome and family-friendly: no weapons, no blood, no injuries, fully clothed.`;
 
-Keep the subject recognizable: ${draft.subject_visual}
+  try {
+    return await editImage(image, mimeType, prompt);
+  } catch (e) {
+    // 출력 그림이 안전 필터에 걸리면, 배경을 빼고 소품을 순하게 바꿔 한 번 더 시도한다
+    if (!(e instanceof APIError) || e.code !== "moderation_blocked") throw e;
+    console.warn("moderation_blocked, retrying", JSON.stringify({
+      job: draft.job,
+      outfit: draft.outfit_prompt,
+      details: (e.error as { moderation_details?: unknown } | undefined)?.moderation_details,
+    }));
+    const safer = `${PAINT_STYLE}
 
-The subject is a "${draft.job}" in the year ${ERA_YEAR}, ${ERA_LABEL} era (floating sky cities above a flooded Earth).
-Outfit and props: ${draft.outfit_prompt}
-Background (very simple scribbles only): ${draft.background_prompt}`;
+Keep it recognizable only through a few key traits: ${draft.subject_visual}.
+Draw the ${subject} smiling, wearing a simple futuristic work uniform with one harmless tool. Plain white background. Cute and wholesome.`;
+    return await editImage(image, mimeType, safer);
+  }
+}
 
+async function editImage(image: Buffer, mimeType: string, prompt: string) {
   const result = await getClient().images.edit({
     model: IMAGE_MODEL,
     image: await toFile(image, mimeType === "image/png" ? "photo.png" : "photo.jpg", { type: mimeType }),
